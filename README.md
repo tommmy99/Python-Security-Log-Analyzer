@@ -9,10 +9,12 @@ The project demonstrates log parsing, input validation, time-window-based detect
 - **CSV log parsing** — Reads authentication events from CSV files.
 - **Input validation** — Validates timestamps, IP addresses, event types, and required fields.
 - **Event statistics** — Counts successful and failed authentication events, malformed rows, and unique IP addresses.
-- **Brute-force pattern detection** — Identifies IP addresses generating repeated failed login attempts within a configurable sliding time window.
-- **Structured alerts** — Reports detection rule identifiers, thresholds, failure counts, and relevant timestamps.
-- **JSON reporting** — Produces a machine-readable report for further inspection or integration.
-- **Automated testing** — Includes unit tests for detection logic, malformed input, timestamp normalization, and edge cases.
+- **AUTH-001: Repeated failures** — Detects repeated failed authentication attempts from the same source IP within a configurable sliding time window.
+- **AUTH-002: Multiple source IPs** — Detects a username receiving failed authentication attempts from multiple distinct source IP addresses within the configured time window.
+- **AUTH-003: Multiple targeted usernames** — Detects a source IP generating failed authentication attempts against multiple distinct usernames within the configured time window.
+- **Structured alerts** — Includes rule identifiers, descriptions, thresholds, and relevant timestamps in detection results.
+- **JSON reporting** — Prints a machine-readable report and saves it to `reports/report.json`.
+- **Automated testing** — Includes unit tests for detection rules, malformed input, timestamp normalization, time-window behavior, and edge cases.
 - **Continuous integration** — Uses GitHub Actions to run tests and execute the sample analysis.
 
 ## Requirements
@@ -55,48 +57,49 @@ The input file must be a CSV containing the following columns:
 |---|---|
 | `timestamp` | ISO 8601 date and time of the event |
 | `ip` | Source IP address |
+| `username` | Username associated with the authentication attempt |
 | `event` | Authentication event type: `FAILED` or `SUCCESS` |
 
 Example:
 
 ```csv
-timestamp,ip,event
-2026-10-24T09:00:00,192.0.2.10,FAILED
-2026-10-24T09:01:00,192.0.2.10,FAILED
-2026-10-24T09:02:00,192.0.2.10,SUCCESS
+timestamp,ip,username,event
+2026-10-24T09:00:00,192.0.2.10,alice,FAILED
+2026-10-24T09:01:00,192.0.2.10,bob,FAILED
+2026-10-24T09:02:00,192.0.2.10,alice,SUCCESS
 ```
 
 The included sample data uses documentation IP addresses and is synthetic.
-
 ## Detection Logic
 
-The analyzer groups failed authentication events by source IP address and evaluates them using a sliding time window.
+The analyzer processes authentication events in chronological order and evaluates failed attempts using configurable sliding time windows. Successful authentication events are counted but excluded from the three failure-based detection rules.
 
-An alert is generated when the number of failed attempts within the configured window reaches or exceeds the threshold.
+The default threshold is five and the default detection window is ten minutes.
 
-Each alert includes information such as:
+The analyzer implements the following rules:
 
-- Source IP address
-- Total failed attempts observed for that IP
-- Maximum number of failures within the detection window
-- First and last observed failure timestamps
-- Start and end timestamps of the window that achieved the maximum
-- Detection rule identifier (`AUTH-001`)
-- Configured threshold and window duration
+- **AUTH-001 — Repeated failures from one IP:** Detects a source IP generating at least the configured number of failed authentication attempts within the time window.
+- **AUTH-002 — Multiple source IPs targeting one username:** Detects a username receiving failed authentication attempts from at least the configured number of distinct source IP addresses within the time window.
+- **AUTH-003 — One IP targeting multiple usernames:** Detects a source IP generating failed authentication attempts against at least the configured number of distinct usernames within the time window.
 
-Alerts are ordered by detection severity, with IP addresses used as a deterministic tie-breaker.
+Alerts include the applicable rule identifier, a description, the configured threshold and window duration, and relevant timestamps or counts.
+
+For AUTH-001, alerts also include the total number of observed failures, the maximum number of failures within a detection window, and the first and last observed failure timestamps.
+
+The `--threshold` and `--window-minutes` command-line options allow the detection settings to be customized.
+
+These rules identify patterns that may warrant investigation; they do not establish that an attack has occurred.
 
 ## Output
 
 The analyzer prints a JSON report to the terminal and saves it to `reports/report.json`.
-
-The report contains three main sections:
+The report contains the following sections:
 
 - **`summary`** — Counts of valid events, successful and failed events, malformed rows, and unique IP addresses.
-- **`suspicious_ips`** — Alerts for IP addresses that meet the configured detection threshold.
+- **`suspicious_ips`** — AUTH-001 alerts for repeated failed attempts from individual source IP addresses.
+- **`suspicious_usernames`** — AUTH-002 alerts for usernames targeted by multiple distinct source IP addresses.
+- **`suspicious_ip_targets`** — AUTH-003 alerts for source IP addresses targeting multiple distinct usernames.
 - **`configuration`** — The threshold and time window used during analysis.
-
-The generated `reports/` directory is excluded from version control to avoid committing generated output by default.
 
 ## Testing and Continuous Integration
 
@@ -118,7 +121,7 @@ This tool identifies patterns that may warrant further investigation. An alert d
 
 The current implementation:
 
-- Does not detect distributed attacks involving multiple source IP addresses.
+- Does not correlate authentication attempts across multiple source IP addresses to identify broader distributed attack campaigns beyond the implemented detection rules.
 - Does not correlate events across different systems.
 - Does not establish whether an IP address belongs to a legitimate user, a proxy, or an attacker.
 - Does not replace a SIEM, an intrusion detection system, or a full incident-response process.
