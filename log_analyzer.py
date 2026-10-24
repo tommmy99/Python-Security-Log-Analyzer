@@ -14,7 +14,7 @@ def parse_timestamp(value):
 
     #* Treat timestamps without timezone information as UTC
     #* This ensures that all timestamps can be compared consistently
-    
+
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
@@ -55,10 +55,10 @@ def analyze_log(path, threshold=5, window_minutes=10):
         #* Validate each row and retain only well-formed authentication events
         for row in reader:
             try:
-                
+
                 #* Parse the timestamp and normalize it to UTC.
                 timestamp = parse_timestamp(row["timestamp"])
-                
+
                 #* Validate the IP address and store its canonical representation
                 ip = str(
                     ipaddress.ip_address(row["ip"].strip())
@@ -66,7 +66,7 @@ def analyze_log(path, threshold=5, window_minutes=10):
 
                 #* Normalize the event type to avoid case-sensitive mismatches
                 event_type = row["event"].strip().upper()
-                
+
                 #* Only the supported authentication outcomes are accepted
                 if event_type not in {"FAILED", "SUCCESS"}:
                     raise ValueError("Unknown event type")
@@ -89,11 +89,16 @@ def analyze_log(path, threshold=5, window_minutes=10):
     event_counts = Counter()
     failures_by_ip = Counter()
     successful_by_ip = Counter()
-    
+
     #* Store recent failed-attempt timestamps separately for each IP address
     #* A deque allows old timestamps to be removed efficiently from the front
     windows = defaultdict(deque)
-    
+
+    #* Dictionaries that will store the time boundaries for the failures and the detection window.
+    first_failure_by_ip = {}
+    last_failure_by_ip = {}
+    detection_window_by_ip = {}
+
     #* Record the highest number of failures observed in any window for each IP
     max_failures_in_window = Counter()
 
@@ -111,9 +116,15 @@ def analyze_log(path, threshold=5, window_minutes=10):
         if event["event"] == "SUCCESS":
             successful_by_ip[ip] += 1
             continue
-        
+
         #* Count all failed attempts for this IP, regardless of their time
         failures_by_ip[ip] += 1
+
+        #* Record the first and most recent failed attempt for each IP
+        if ip not in first_failure_by_ip:
+            first_failure_by_ip[ip] = timestamp
+
+        last_failure_by_ip[ip] = timestamp
 
         #* Retrieve the queue of recent failed attempts for the current IP
         recent = windows[ip]
@@ -125,35 +136,46 @@ def analyze_log(path, threshold=5, window_minutes=10):
         #* Include the current failed attempt in the active window
         recent.append(timestamp)
 
-        #* Keep the largest number of failures observed in a single window
-        max_failures_in_window[ip] = max(
-            max_failures_in_window[ip],
-            len(recent),
-        )
+        current_count = len(recent)
+
+        if current_count > max_failures_in_window[ip]:
+            max_failures_in_window[ip] = current_count
+            detection_window_by_ip[ip] = {
+                "start": recent[0],
+                "end": timestamp,
+            }
 
     suspicious_ips = []
 
     #* Flag IP addresses whose maximum failure count reaches the threshold
     for ip, count in max_failures_in_window.items():
         if count >= threshold:
+
+            window_details = detection_window_by_ip[ip]
+
             suspicious_ips.append({
                 "ip": ip,
-                
-                #* Total failures from this IP across the entire log
                 "failed_attempts": failures_by_ip[ip],
-                
-                #* Maximum failures observed within the configured time window
                 "max_failures_in_window": count,
-                
-                #* Include detection settings to make the report interpretable
+                "first_failure": first_failure_by_ip[ip].isoformat(),
+                "last_failure": last_failure_by_ip[ip].isoformat(),
+                "detection_window_start": window_details["start"].isoformat(),
+                "detection_window_end": window_details["end"].isoformat(),
+                "rule_id": "AUTH-001",
+                "rule_description": (
+                    "Repeated failed authentication attempts from one IP "
+                    "within the configured time window."
+                ),
                 "threshold": threshold,
                 "window_minutes": window_minutes,
             })
 
     #* Show the IP addresses with the highest observed failure counts first
     suspicious_ips.sort(
-        key=lambda item: item["max_failures_in_window"],
-        reverse=True,
+        key=lambda item: (
+            -item["max_failures_in_window"],
+            item["ip"],
+        )
     )
 
     #* Return a structured report that can be printed or serialized as JSON
@@ -163,7 +185,7 @@ def analyze_log(path, threshold=5, window_minutes=10):
             "failed_events": event_counts["FAILED"],
             "successful_events": event_counts["SUCCESS"],
             "malformed_rows": malformed_rows,
-            
+
             #* Count distinct IP addresses among validated events
             "unique_ips": len({
                 event["ip"] for event in events
@@ -178,7 +200,7 @@ def analyze_log(path, threshold=5, window_minutes=10):
 
 #! Parse command-line arguments, run the analysis, and save the report
 def main():
-    
+
     #* Define the command-line interface and its usage description
     parser = argparse.ArgumentParser(
         description=(
@@ -218,7 +240,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        
+
         #* Analyze the input using the selected detection parameters
         report = analyze_log(
             args.logfile,
@@ -227,7 +249,7 @@ def main():
         )
 
         output_path = Path(args.output)
-        
+
         #* Create the output directory if it does not already exist
         output_path.parent.mkdir(
             parents=True,
