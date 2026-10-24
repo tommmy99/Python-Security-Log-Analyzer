@@ -42,14 +42,14 @@ def analyze_log(path, threshold=5, window_minutes=10):
         reader = csv.DictReader(file)
 
         #* Verify that the input contains all fields required for analysis
-        required_columns = {"timestamp", "ip", "event"}
+        required_columns = {"timestamp", "ip", "username", "event"}
 
         if (
             not reader.fieldnames
             or not required_columns.issubset(reader.fieldnames)
         ):
             raise ValueError(
-                "CSV must contain timestamp, ip, event columns."
+                "CSV must contain timestamp, ip, username, event columns."
             )
 
         #* Validate each row and retain only well-formed authentication events
@@ -64,6 +64,12 @@ def analyze_log(path, threshold=5, window_minutes=10):
                     ipaddress.ip_address(row["ip"].strip())
                 )
 
+                #* Read and normalize the username
+                username = row["username"].strip()
+
+                if not username:
+                    raise ValueError("Missing username")
+
                 #* Normalize the event type to avoid case-sensitive mismatches
                 event_type = row["event"].strip().upper()
 
@@ -75,6 +81,7 @@ def analyze_log(path, threshold=5, window_minutes=10):
                 events.append({
                     "timestamp": timestamp,
                     "ip": ip,
+                    "username": username,
                     "event": event_type,
                 })
 
@@ -94,6 +101,12 @@ def analyze_log(path, threshold=5, window_minutes=10):
     #* A deque allows old timestamps to be removed efficiently from the front
     windows = defaultdict(deque)
 
+    #* Track recent failed attempts for each username and source IP
+    failures_by_username = defaultdict(deque)
+
+    #* Track recent distinct usernames targeted by each source IP
+    usernames_by_ip = defaultdict(deque)
+
     #* Dictionaries that will store the time boundaries for the failures and the detection window.
     first_failure_by_ip = {}
     last_failure_by_ip = {}
@@ -102,11 +115,21 @@ def analyze_log(path, threshold=5, window_minutes=10):
     #* Record the highest number of failures observed in any window for each IP
     max_failures_in_window = Counter()
 
+    #* Track the maximum number of distinct source IPs per username
+    max_ips_per_username = Counter()
+    detection_window_by_username = {}
+
+    #* Track the maximum number of distinct usernames per source IP
+    max_usernames_per_ip = Counter()
+    detection_window_by_ip_usernames = {}
+
     window = timedelta(minutes=window_minutes)
+
 
     #* Analyze validated events in chronological order
     for event in events:
         ip = event["ip"]
+        username = event["username"]
         timestamp = event["timestamp"]
 
         #* Count successful and failed events across the entire input
@@ -119,6 +142,61 @@ def analyze_log(path, threshold=5, window_minutes=10):
 
         #* Count all failed attempts for this IP, regardless of their time
         failures_by_ip[ip] += 1
+
+        #* Track failed attempts for each username and source IP
+        failures_by_username[username].append((timestamp, ip))
+
+        #* Retrieve recent failed attempts for the current username
+        username_attempts = failures_by_username[username]
+
+        #* Remove attempts outside the configured time window
+        while (
+            username_attempts
+            and timestamp - username_attempts[0][0] > window
+        ):
+            username_attempts.popleft()
+
+        #* Count distinct source IPs targeting this username
+        distinct_ips = {
+            attempt_ip
+            for _, attempt_ip in username_attempts
+        }
+
+        #* Update the maximum number of distinct IPs observed
+        if len(distinct_ips) > max_ips_per_username[username]:
+            max_ips_per_username[username] = len(distinct_ips)
+            detection_window_by_username[username] = {
+                "start": username_attempts[0][0],
+                "end": timestamp,
+            }
+
+        #* Track failed attempts for each source IP and targeted username
+        usernames_by_ip[ip].append((timestamp, username))
+
+
+        #* Retrieve recent failed attempts for the current source IP
+        ip_attempts = usernames_by_ip[ip]
+
+        #* Remove attempts outside the configured time window
+        while (
+            ip_attempts
+            and timestamp - ip_attempts[0][0] > window
+        ):
+            ip_attempts.popleft()
+
+        #* Count distinct usernames targeted by this source IP
+        distinct_usernames = {
+            attempt_username
+            for _, attempt_username in ip_attempts
+        }
+
+        #* Update the maximum number of distinct usernames observed
+        if len(distinct_usernames) > max_usernames_per_ip[ip]:
+            max_usernames_per_ip[ip] = len(distinct_usernames)
+            detection_window_by_ip_usernames[ip] = {
+                "start": ip_attempts[0][0],
+                "end": timestamp,
+            }
 
         #* Record the first and most recent failed attempt for each IP
         if ip not in first_failure_by_ip:
@@ -144,6 +222,59 @@ def analyze_log(path, threshold=5, window_minutes=10):
                 "start": recent[0],
                 "end": timestamp,
             }
+
+
+    suspicious_usernames = []
+
+    #* Flag usernames targeted by enough distinct source IPs
+    for username, count in max_ips_per_username.items():
+        if count >= threshold:
+            window_details = detection_window_by_username[username]
+
+            suspicious_usernames.append({
+                "username": username,
+                "distinct_source_ips": count,
+                "detection_window_start": (
+                    window_details["start"].isoformat()
+                ),
+                "detection_window_end": (
+                    window_details["end"].isoformat()
+                ),
+                "rule_id": "AUTH-002",
+                "rule_description": (
+                    "The same username received failed authentication "
+                    "attempts from multiple source IPs within the "
+                    "configured time window."
+                ),
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+            })
+
+    suspicious_ip_targets = []
+
+    #* Flag source IPs targeting enough distinct usernames
+    for ip, count in max_usernames_per_ip.items():
+        if count >= threshold:
+            window_details = detection_window_by_ip_usernames[ip]
+
+            suspicious_ip_targets.append({
+                "ip": ip,
+                "distinct_usernames": count,
+                "detection_window_start": (
+                    window_details["start"].isoformat()
+                ),
+                "detection_window_end": (
+                    window_details["end"].isoformat()
+                ),
+                "rule_id": "AUTH-003",
+                "rule_description": (
+                    "The same source IP generated failed authentication "
+                    "attempts against multiple usernames within the "
+                    "configured time window."
+                ),
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+            })
 
     suspicious_ips = []
 
@@ -192,6 +323,8 @@ def analyze_log(path, threshold=5, window_minutes=10):
             }),
         },
         "suspicious_ips": suspicious_ips,
+        "suspicious_usernames": suspicious_usernames,
+        "suspicious_ip_targets": suspicious_ip_targets,
         "configuration": {
             "threshold": threshold,
             "window_minutes": window_minutes,

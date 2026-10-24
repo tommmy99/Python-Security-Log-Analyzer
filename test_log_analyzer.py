@@ -16,9 +16,35 @@ class TestLogAnalyzer(unittest.TestCase):
         #* Each test uses its own CSV file to avoid modifying project data.
         self.log_path = Path(self.temp_dir.name) / "test.csv"
 
+
     #! Write CSV content to the temporary test file
     def write_log(self, content):
-        self.log_path.write_text(content, encoding="utf-8")
+        lines = content.splitlines()
+
+        if not lines:
+            self.log_path.write_text(content, encoding="utf-8")
+            return
+
+        header = lines[0].strip().split(",")
+
+        if "username" not in header and "event" in header:
+            event_index = header.index("event")
+            header.insert(event_index, "username")
+            lines[0] = ",".join(header)
+
+            for index in range(1, len(lines)):
+                if not lines[index].strip():
+                    continue
+
+                values = lines[index].split(",")
+                values.insert(event_index, "test-user")
+                lines[index] = ",".join(values)
+
+        self.log_path.write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
+
 
     def test_detects_repeated_failures(self):
 
@@ -365,6 +391,115 @@ class TestLogAnalyzer(unittest.TestCase):
             [alert["max_failures_in_window"] for alert in alerts],
             [3, 3],
         )
+
+
+    def test_detects_same_username_from_multiple_ips(self):
+        """Detect a username targeted by multiple distinct IPs."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:01:00,192.0.2.20,alice,FAILED\n"
+            "2026-10-24T09:02:00,192.0.2.30,alice,FAILED\n"
+            "2026-10-24T09:03:00,192.0.2.40,alice,FAILED\n"
+            "2026-10-24T09:04:00,192.0.2.50,alice,FAILED\n"
+        )
+
+        report = analyze_log(self.log_path)
+        alerts = report["suspicious_usernames"]
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["username"], "alice")
+        self.assertEqual(alerts[0]["distinct_source_ips"], 5)
+        self.assertEqual(alerts[0]["rule_id"], "AUTH-002")
+
+
+    def test_auth002_counts_distinct_ips_not_attempts(self):
+        """Repeated attempts from one IP count as one source IP."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:01:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:02:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:03:00,192.0.2.20,alice,FAILED\n"
+            "2026-10-24T09:04:00,192.0.2.30,alice,FAILED\n"
+        )
+
+        report = analyze_log(self.log_path)
+
+        self.assertEqual(report["suspicious_usernames"], [])
+
+    def test_auth002_ignores_ips_outside_time_window(self):
+        """IPs outside the time window must not trigger AUTH-002."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:11:00,192.0.2.20,alice,FAILED\n"
+            "2026-10-24T09:22:00,192.0.2.30,alice,FAILED\n"
+            "2026-10-24T09:33:00,192.0.2.40,alice,FAILED\n"
+            "2026-10-24T09:44:00,192.0.2.50,alice,FAILED\n"
+        )
+
+        report = analyze_log(self.log_path)
+
+        self.assertEqual(report["suspicious_usernames"], [])
+
+    def test_detects_one_ip_targeting_multiple_usernames(self):
+        """Detect one IP targeting multiple distinct usernames."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:01:00,192.0.2.10,bob,FAILED\n"
+            "2026-10-24T09:02:00,192.0.2.10,charlie,FAILED\n"
+            "2026-10-24T09:03:00,192.0.2.10,david,FAILED\n"
+            "2026-10-24T09:04:00,192.0.2.10,erin,FAILED\n"
+        )
+
+        report = analyze_log(
+            self.log_path,
+            threshold=5,
+            window_minutes=10,
+        )
+
+        alerts = report["suspicious_ip_targets"]
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["ip"], "192.0.2.10")
+        self.assertEqual(alerts[0]["distinct_usernames"], 5)
+        self.assertEqual(alerts[0]["rule_id"], "AUTH-003")
+
+    def test_auth003_counts_distinct_usernames_not_attempts(self):
+        """Repeated attempts against one username count only once."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:01:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:02:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:03:00,192.0.2.10,bob,FAILED\n"
+            "2026-10-24T09:04:00,192.0.2.10,charlie,FAILED\n"
+        )
+
+        report = analyze_log(self.log_path)
+
+        self.assertEqual(report["suspicious_ip_targets"], [])
+
+    def test_auth003_ignores_usernames_outside_time_window(self):
+        """Usernames outside the time window must not trigger AUTH-003."""
+        self.write_log(
+            "timestamp,ip,username,event\n"
+            "2026-10-24T09:00:00,192.0.2.10,alice,FAILED\n"
+            "2026-10-24T09:11:00,192.0.2.10,bob,FAILED\n"
+            "2026-10-24T09:22:00,192.0.2.10,charlie,FAILED\n"
+            "2026-10-24T09:33:00,192.0.2.10,david,FAILED\n"
+            "2026-10-24T09:44:00,192.0.2.10,erin,FAILED\n"
+        )
+
+        report = analyze_log(
+            self.log_path,
+            threshold=5,
+            window_minutes=10,
+        )
+
+        self.assertEqual(report["suspicious_ip_targets"], [])
 
 if __name__ == "__main__":
     unittest.main()
