@@ -1,25 +1,35 @@
 # Python Security Log Analyzer
 
-A lightweight Python tool for analyzing authentication logs and identifying potentially suspicious login activity.
+A lightweight Python tool for analyzing authentication logs, detecting repeated failed login attempts, and generating structured security reports.
+
+The project demonstrates log parsing, input validation, time-window-based detection, automated testing, and continuous integration using GitHub Actions.
 
 ## Features
 
-- Parses CSV authentication logs.
-- Validates timestamps, IP addresses, and event types.
-- Counts successful and failed authentication events.
-- Detects repeated failed login attempts within a configurable time window.
-- Generates a structured JSON report.
-- Handles malformed log entries and missing files.
-- Includes automated unit tests.
+- **CSV log parsing** — Reads authentication events from CSV files.
+- **Input validation** — Validates timestamps, IP addresses, event types, and required fields.
+- **Event statistics** — Counts successful and failed authentication events, malformed rows, and unique IP addresses.
+- **Brute-force pattern detection** — Identifies IP addresses generating repeated failed login attempts within a configurable sliding time window.
+- **Structured alerts** — Reports detection rule identifiers, thresholds, failure counts, and relevant timestamps.
+- **JSON reporting** — Produces a machine-readable report for further inspection or integration.
+- **Automated testing** — Includes unit tests for detection logic, malformed input, timestamp normalization, and edge cases.
+- **Continuous integration** — Uses GitHub Actions to run tests and execute the sample analysis.
 
 ## Requirements
 
 - Python 3.10 or newer
 - No third-party dependencies
 
-## Usage
+## Getting Started
 
-Run the analyzer:
+Clone the repository and navigate to the project directory:
+
+```bash
+git clone https://github.com/tommmy99/Python-Security-Log-Analyzer.git
+cd Python-Security-Log-Analyzer
+```
+
+Run the analyzer against the included sample logs:
 
 ```bash
 python log_analyzer.py sample_logs.csv
@@ -37,39 +47,94 @@ Run the automated tests:
 python -m unittest -v
 ```
 
+## Input Format
+
+The input file must be a CSV containing the following columns:
+
+| Column | Description |
+|---|---|
+| `timestamp` | ISO 8601 date and time of the event |
+| `ip` | Source IP address |
+| `event` | Authentication event type: `FAILED` or `SUCCESS` |
+
+Example:
+
+```csv
+timestamp,ip,event
+2026-10-24T09:00:00,192.0.2.10,FAILED
+2026-10-24T09:01:00,192.0.2.10,FAILED
+2026-10-24T09:02:00,192.0.2.10,SUCCESS
+```
+
+The included sample data uses documentation IP addresses and is synthetic.
+
 ## Detection Logic
 
-The tool groups failed authentication events by IP address and analyzes them using a sliding time window.
+The analyzer groups failed authentication events by source IP address and evaluates them using a sliding time window.
 
-An alert is generated when the number of failed attempts within the configured time window reaches the specified threshold.
+An alert is generated when the number of failed attempts within the configured window reaches or exceeds the threshold.
+
+Each alert includes information such as:
+
+- Source IP address
+- Total failed attempts observed for that IP
+- Maximum number of failures within the detection window
+- First and last observed failure timestamps
+- Start and end timestamps of the window that achieved the maximum
+- Detection rule identifier (`AUTH-001`)
+- Configured threshold and window duration
+
+Alerts are ordered by detection severity, with IP addresses used as a deterministic tie-breaker.
 
 ## Output
 
-The tool generates a JSON report containing:
+The analyzer prints a JSON report to the terminal and saves it to `reports/report.json`.
 
-- Total valid events
-- Successful and failed authentication counts
-- Number of malformed rows
-- Number of unique IP addresses
-- Potentially suspicious IP addresses
-- Detection configuration
+The report contains three main sections:
+
+- **`summary`** — Counts of valid events, successful and failed events, malformed rows, and unique IP addresses.
+- **`suspicious_ips`** — Alerts for IP addresses that meet the configured detection threshold.
+- **`configuration`** — The threshold and time window used during analysis.
+
+The generated `reports/` directory is excluded from version control to avoid committing generated output by default.
+
+## Testing and Continuous Integration
+
+The project includes unit tests covering:
+
+- Repeated failures and configurable thresholds
+- Failures inside and outside the time window
+- Boundary conditions
+- Timestamp normalization across time zones
+- Invalid IP addresses, timestamps, event types, and incomplete rows
+- Missing files and required CSV columns
+- Alert metadata and deterministic ordering
+
+GitHub Actions runs the test suite and executes the sample analysis on pushes to the configured branches and on pull requests targeting `main`.
 
 ## Limitations
 
-This tool identifies patterns that may warrant investigation. An alert does not prove that an attack occurred or identify the person responsible.
+This tool identifies patterns that may warrant further investigation. An alert does not prove that an attack occurred or identify the person responsible.
 
-The current implementation does not detect distributed attacks involving multiple IP addresses or correlate events across different systems.
+The current implementation:
 
-The included logs are synthetic and intended for educational purposes.
+- Does not detect distributed attacks involving multiple source IP addresses.
+- Does not correlate events across different systems.
+- Does not establish whether an IP address belongs to a legitimate user, a proxy, or an attacker.
+- Does not replace a SIEM, an intrusion detection system, or a full incident-response process.
+
+The included logs are synthetic and intended for educational and testing purposes.
 
 ## Security and Privacy
 
-Only analyze logs you are authorized to access. Review log files and reports for sensitive information before sharing them publicly.
+Only analyze logs you are authorized to access. Authentication logs may contain personal data or other sensitive information. Review both input files and generated reports before sharing them.
 
 ## Future Improvements
 
-- Support additional authentication log formats.
-- Add more detection rules.
-- Include severity levels and remediation recommendations.
-- Generate human-readable HTML reports.
-- Automate testing with GitHub Actions.
+Potential extensions include:
+
+- Detection of distributed login attacks across multiple IP addresses
+- Configurable detection rules
+- Additional input formats and log sources
+- More detailed test coverage and edge-case handling
+- Improved report summaries for security investigations
