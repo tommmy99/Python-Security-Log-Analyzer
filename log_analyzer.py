@@ -1,0 +1,253 @@
+import argparse
+import csv
+import ipaddress
+import json
+
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+#! Parse an ISO 8601 timestamp and normalize it to UTC
+def parse_timestamp(value):
+    timestamp = datetime.fromisoformat(value.strip())
+
+    #* Treat timestamps without timezone information as UTC
+    #* This ensures that all timestamps can be compared consistently
+    
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    #* Convert timezone-aware timestamps to UTC for consistent processing
+    return timestamp.astimezone(timezone.utc)
+
+#! Analyze authentication logs and detect repeated failures
+def analyze_log(path, threshold=5, window_minutes=10):
+
+    #* Reject invalid detection settings before processing the input file
+    if threshold < 1 or window_minutes < 1:
+        raise ValueError("Threshold and window must be positive.")
+
+    path = Path(path)
+
+    #*Ensure that the input path points to an existing file
+    if not path.is_file():
+        raise FileNotFoundError(f"Log file not found: {path}")
+
+    events = []
+    malformed_rows = 0
+
+    #* Read the CSV using DictReader so each field can be accessed by name
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+
+        #* Verify that the input contains all fields required for analysis
+        required_columns = {"timestamp", "ip", "event"}
+
+        if (
+            not reader.fieldnames
+            or not required_columns.issubset(reader.fieldnames)
+        ):
+            raise ValueError(
+                "CSV must contain timestamp, ip, event columns."
+            )
+
+        #* Validate each row and retain only well-formed authentication events
+        for row in reader:
+            try:
+                
+                #* Parse the timestamp and normalize it to UTC.
+                timestamp = parse_timestamp(row["timestamp"])
+                
+                #* Validate the IP address and store its canonical representation
+                ip = str(
+                    ipaddress.ip_address(row["ip"].strip())
+                )
+
+                #* Normalize the event type to avoid case-sensitive mismatches
+                event_type = row["event"].strip().upper()
+                
+                #* Only the supported authentication outcomes are accepted
+                if event_type not in {"FAILED", "SUCCESS"}:
+                    raise ValueError("Unknown event type")
+
+                #* Store validated events in a consistent internal format
+                events.append({
+                    "timestamp": timestamp,
+                    "ip": ip,
+                    "event": event_type,
+                })
+
+            #* Count malformed rows instead of stopping the entire analysis
+            except (ValueError, AttributeError, TypeError):
+                malformed_rows += 1
+
+    #* Process events chronologically so the sliding-window detection is correct
+    events.sort(key=lambda event: event["timestamp"])
+
+    #* Track overall event counts and per-IP authentication statistics
+    event_counts = Counter()
+    failures_by_ip = Counter()
+    successful_by_ip = Counter()
+    
+    #* Store recent failed-attempt timestamps separately for each IP address
+    #* A deque allows old timestamps to be removed efficiently from the front
+    windows = defaultdict(deque)
+    
+    #* Record the highest number of failures observed in any window for each IP
+    max_failures_in_window = Counter()
+
+    window = timedelta(minutes=window_minutes)
+
+    #* Analyze validated events in chronological order
+    for event in events:
+        ip = event["ip"]
+        timestamp = event["timestamp"]
+
+        #* Count successful and failed events across the entire input
+        event_counts[event["event"]] += 1
+
+        #* Successful logins contribute to statistics but not to failure alerts
+        if event["event"] == "SUCCESS":
+            successful_by_ip[ip] += 1
+            continue
+        
+        #* Count all failed attempts for this IP, regardless of their time
+        failures_by_ip[ip] += 1
+
+        #* Retrieve the queue of recent failed attempts for the current IP
+        recent = windows[ip]
+
+        #* Remove attempts that fall outside the configured time window
+        while recent and timestamp - recent[0] > window:
+            recent.popleft()
+
+        #* Include the current failed attempt in the active window
+        recent.append(timestamp)
+
+        #* Keep the largest number of failures observed in a single window
+        max_failures_in_window[ip] = max(
+            max_failures_in_window[ip],
+            len(recent),
+        )
+
+    suspicious_ips = []
+
+    #* Flag IP addresses whose maximum failure count reaches the threshold
+    for ip, count in max_failures_in_window.items():
+        if count >= threshold:
+            suspicious_ips.append({
+                "ip": ip,
+                
+                #* Total failures from this IP across the entire log
+                "failed_attempts": failures_by_ip[ip],
+                
+                #* Maximum failures observed within the configured time window
+                "max_failures_in_window": count,
+                
+                #* Include detection settings to make the report interpretable
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+            })
+
+    #* Show the IP addresses with the highest observed failure counts first
+    suspicious_ips.sort(
+        key=lambda item: item["max_failures_in_window"],
+        reverse=True,
+    )
+
+    #* Return a structured report that can be printed or serialized as JSON
+    return {
+        "summary": {
+            "total_valid_events": len(events),
+            "failed_events": event_counts["FAILED"],
+            "successful_events": event_counts["SUCCESS"],
+            "malformed_rows": malformed_rows,
+            
+            #* Count distinct IP addresses among validated events
+            "unique_ips": len({
+                event["ip"] for event in events
+            }),
+        },
+        "suspicious_ips": suspicious_ips,
+        "configuration": {
+            "threshold": threshold,
+            "window_minutes": window_minutes,
+        },
+    }
+
+#! Parse command-line arguments, run the analysis, and save the report
+def main():
+    
+    #* Define the command-line interface and its usage description
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze authentication logs for suspicious patterns"
+        )
+    )
+
+    #* Positional argument specifying the CSV file to analyze.
+    parser.add_argument(
+        "logfile",
+        help="Path to the input CSV file",
+    )
+
+    #* Optional threshold: the number of failures needed to trigger an alert
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help="Failed attempts required to trigger an alert",
+    )
+
+    #* Optional duration of the sliding window used by the detection logic
+    parser.add_argument(
+        "--window-minutes",
+        type=int,
+        default=10,
+        help="Time window in minutes",
+    )
+
+    #* Optional destination for the generated JSON report
+    parser.add_argument(
+        "--output",
+        default="reports/report.json",
+        help="Output JSON report path",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        
+        #* Analyze the input using the selected detection parameters
+        report = analyze_log(
+            args.logfile,
+            args.threshold,
+            args.window_minutes,
+        )
+
+        output_path = Path(args.output)
+        
+        #* Create the output directory if it does not already exist
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        #* Serialize the report as readable JSON and write it to disk
+        output_path.write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+
+        #* Print the same report to the terminal for immediate inspection
+        print(json.dumps(report, indent=2))
+        print(f"\nReport saved to: {output_path}")
+
+    #* Convert common file, input-validation, and CSV errors into CLI messages
+    except (OSError, ValueError, csv.Error) as error:
+        parser.error(str(error))
+
+
+if __name__ == "__main__":
+    main()

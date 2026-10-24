@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+@"
+
+# Generated reports
+reports/
+
+# Local test artifacts
+.coverage
+"@ | Add-Content .\.gitignore
+
